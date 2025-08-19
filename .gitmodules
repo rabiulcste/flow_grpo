@@ -1,0 +1,3 @@
+[submodule "bagel"]
+	path = bagel
+	url = git@github.com:rabiulcste/Bagel.git
