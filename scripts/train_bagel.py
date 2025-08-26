@@ -4,16 +4,13 @@ Bagel Training Script for Flow-GRPO
 
 This script provides a clean implementation of Bagel training with Flow-GRPO,
 using Bagel's native methods and Flow-GRPO's policy optimization.
-
-CRITICAL FIX (v1.1): LoRA is now applied to bagel_model BEFORE creating the pipeline,
-ensuring both training and sampling use the updated policy. This is simpler and cleaner
-than modifying the pipeline after creation.
 """
 
 from collections import defaultdict
 import os
 import datetime
 import json
+import tempfile
 from absl import app, flags
 from accelerate import Accelerator
 from ml_collections import config_flags
@@ -120,7 +117,7 @@ class GenevalPromptDataset(Dataset):
         metadatas = [example["metadata"] for example in examples]
         return prompts, metadatas
 
-def load_bagel_model(config):
+def load_bagel_model(config, accelerator):
     """Load Bagel model for training."""
     # Import Bagel components
     from bagel.modeling.bagel import Bagel, BagelConfig, Qwen2ForCausalLM, Qwen2Config, SiglipVisionModel, SiglipVisionConfig
@@ -128,8 +125,9 @@ def load_bagel_model(config):
     from bagel.modeling.qwen2 import Qwen2Tokenizer
     from bagel.data.data_utils import add_special_tokens
     
-    # Load model path from config
-    model_path = os.environ["SAVE_DIR"] + "/" + config.pretrained.model
+    # Load model path from config - use current working directory if SAVE_DIR not set
+    save_dir = os.environ.get("SAVE_DIR", os.getcwd())
+    model_path = os.path.join(save_dir, config.pretrained.model)
     logger.info(f"Loading BAGEL model from: {model_path}")
     
     # Load configurations
@@ -279,7 +277,6 @@ def collect_samples_bagel(
     
     # Generate samples for the entire epoch
     samples = []
-    prompts = []
     
     for i in tqdm(
         range(config.sample.num_batches_per_epoch),
@@ -287,10 +284,10 @@ def collect_samples_bagel(
         disable=not accelerator.is_local_main_process,
         position=0,
     ):
-
-        # Get prompts from dataloader iterator
-        prompts_batch, prompt_metadata = next(train_iter)
-        
+        prompts, prompt_metadata = next(train_iter)
+        # The training loop expects advantages to have shape [batch_size, num_train_timesteps]
+        num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction) if hasattr(config.train, 'timestep_fraction') else config.sample.num_steps
+    
         # Generate images using Bagel's native pipeline
         with torch.no_grad():
             # CRITICAL: Memory cleanup and CUDA health check
@@ -300,10 +297,10 @@ def collect_samples_bagel(
             if i == 0 and epoch == 0 and accelerator.is_main_process:
                 logger.info(f"🔍 Sampling from model with {sum(p.numel() for p in pipeline.bagel_model.parameters() if p.requires_grad)} trainable parameters")
             
-            negative_prompts = [""] * len(prompts_batch) if config.train.cfg else None
+            negative_prompts = [""] * len(prompts) if config.train.cfg else None
 
             outputs = pipeline(
-                prompt=prompts_batch,
+                prompt=prompts,
                 height=config.resolution,
                 width=config.resolution,
                 num_inference_steps=config.sample.num_steps,
@@ -312,176 +309,107 @@ def collect_samples_bagel(
                 num_images_per_prompt=config.sample.num_image_per_prompt,
                 output_type="pt",
                 noise_level=config.sample.noise_level,
-            )
-        
+            )        
         images = outputs["images"]
-        latents = outputs["latents"]
-        log_probs = outputs["log_probs"]
-        
+        prompts_batch = [prompt for prompt in prompts for _ in range(config.sample.num_image_per_prompt)]
+        metadata = [{"prompt": prompt} for prompt in prompts_batch]
+        prompts_ids = pipeline.tokenizer.batch_encode_plus(prompts_batch, return_tensors="pt", padding="max_length", max_length=256, truncation=True)["input_ids"].to(accelerator.device)
+        batch_size = len(prompts_batch)
+
         # Validate pipeline output immediately
-        expected_image_count = len(prompts_batch) * config.sample.num_image_per_prompt
         actual_image_count = images.shape[0] if hasattr(images, 'shape') else len(images)
-        if actual_image_count != expected_image_count:
+        if actual_image_count != batch_size:
             raise RuntimeError(
                 f"Bagel pipeline failed to generate correct number of images in batch {i}: "
-                f"Expected {expected_image_count} images "
-                f"(prompts={len(prompts_batch)} * images_per_prompt={config.sample.num_image_per_prompt}), "
+                f"Expected {len(prompts_batch)} images "
+                f"(prompts={len(prompts)} * images_per_prompt={config.sample.num_image_per_prompt}), "
                 f"but pipeline generated {actual_image_count} images. "
                 f"Images shape: {images.shape if hasattr(images, 'shape') else type(images)}. "
                 f"This indicates a bug in the Bagel pipeline's num_images_per_prompt handling."
             )
         
-        # Compute rewards (create metadata matching number of images - Flow-GRPO pattern)
-        metadata = []
-        for prompt in prompts_batch:
-            for _ in range(config.sample.num_image_per_prompt):
-                metadata.append({"prompt": prompt})
         rewards, reward_metadata = reward_fn(images, prompts_batch, metadata, only_strict=True)
-        
-        # Validate reward dimensions immediately after reward function call
-        expected_reward_count = len(prompts_batch) * config.sample.num_image_per_prompt
-        if 'avg' not in rewards:
-            raise RuntimeError(
-                f"Reward function returned invalid structure: missing 'avg' key. "
-                f"Available keys: {list(rewards.keys())}"
-            )
-        actual_reward_count = len(rewards['avg'])
-        if actual_reward_count != expected_reward_count:
+               
+        if len(rewards['avg']) != batch_size:
             raise RuntimeError(
                 f"Reward function dimension mismatch in batch {i}: "
-                f"Expected {expected_reward_count} rewards "
+                f"Expected {len(rewards['avg'])} rewards "
                 f"(prompts={len(prompts_batch)} * images_per_prompt={config.sample.num_image_per_prompt}), "
-                f"but reward_fn returned {actual_reward_count} rewards. "
+                f"but reward_fn returned {len(rewards['avg'])} rewards. "
                 f"Images shape: {images.shape if hasattr(images, 'shape') else type(images)}, "
                 f"Metadata length: {len(metadata)}, "
                 f"Reward keys: {list(rewards.keys())}"
             )
         
+        # Get timesteps from Bagel's scheduler (use all timesteps)
+        timesteps = pipeline.scheduler.timesteps.repeat(len(prompts_batch), 1)
         # Convert rewards to tensors exactly like Flow-GRPO
         rewards_tensor = {
             key: torch.as_tensor(value, device=accelerator.device).float()
             for key, value in rewards.items()
         }
-        
-        # Get timesteps from Bagel's scheduler (use all timesteps)
-        timesteps = pipeline.scheduler.timesteps.repeat(len(prompts_batch) * config.sample.num_image_per_prompt, 1)
-        
-        # Store results exactly like Flow-GRPO
+
         samples.append({
-            "latents": latents,
-            "log_probs": log_probs,
-            "timesteps": timesteps,
-            # "past_key_values": outputs["past_key_values"],  # Store cache for efficient training (Bagel naming)
-            "prompts": prompts_batch,  # Keep prompts for stat tracking
-            "rewards": rewards_tensor,
-        })
-        
-        prompts.extend(prompts_batch)                
-    
-    if not samples:
-        raise RuntimeError("No samples were successfully generated")
-    
-    # Compute advantages exactly like Flow-GRPO
-    # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-    collated_samples = {}
-    for k in samples[0].keys():
-        if k == "past_key_values":
-            # Handle past_key_values specially - just pass through (Bagel handles batching internally)
-            collated_samples[k] = samples[0][k]  # Use first sample's cache for now
-        elif isinstance(samples[0][k], dict):
-            # Handle nested dictionaries (like rewards)
-            collated_samples[k] = {
-                sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
-                for sub_key in samples[0][k]
-            }
-        elif isinstance(samples[0][k], torch.Tensor):
-            # Handle tensors
-            collated_samples[k] = torch.cat([s[k] for s in samples], dim=0)
-        elif k == "prompts":
-            # Handle prompts specially - expand to match num_images_per_prompt
-            collated_samples[k] = []
-            for s in samples:
-                for prompt in s[k]:
-                    collated_samples[k].extend([prompt] * config.sample.num_image_per_prompt)
-        elif isinstance(samples[0][k], list):
-            # Handle other lists - flatten into single list
-            collated_samples[k] = []
-            for s in samples:
-                collated_samples[k].extend(s[k])
-        else:
-            # Handle other types - just collect into list
-            collated_samples[k] = [s[k] for s in samples]
-    
-    samples = collated_samples
-    
-    # Gather rewards across processes (multi-GPU compatible) - EXACTLY like original Flow-GRPO
-    gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
-    gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
-    
+            "prompts_ids": prompts_ids, # [B, 256]
+            "latents": outputs["latents"], # [T, Packed, F] [5, 2048, 64] => [T, Res*B, F] [5, 256*8, 64]
+            "log_probs": outputs["log_probs"], # [B, T-1]
+            "timesteps": timesteps, # [B, T]
+            # "past_key_values": outputs["past_key_values"], # NaiveCache object
+            "rewards": rewards_tensor, # dict of {key: [B, T]}
+        })        
+
+
+    # collate samples into dict
+    samples = {
+        k: torch.cat([s[k] for s in samples], dim=0)
+        if not isinstance(samples[0][k], dict)
+        else {
+            sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
+            for sub_key in samples[0][k]
+        }
+        for k in samples[0].keys()
+    }
+
+    samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
+    # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
+    samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
+    # gather rewards across processes
+    rewards_gather = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
+    rewards_gather = {key: value.cpu().numpy() for key, value in rewards_gather.items()}
+
+    if accelerator.is_main_process:
+        print(f"gathered_rewards['avg'] value: {rewards_gather['avg']}")
+
     if config.per_prompt_stat_tracking and stat_tracker is not None:
-        # gather the prompts across processes - exactly like Flow-GRPO
-        # Prompts are already expanded in the collation step, so use them directly
-        expanded_prompts = samples["prompts"]
-        
-        # Convert to indices for gathering (since we can't gather strings directly)
-        unique_prompts = list(set(expanded_prompts))
-        prompt_to_idx = {prompt: idx for idx, prompt in enumerate(unique_prompts)}
-        prompt_indices = torch.tensor([prompt_to_idx[prompt] for prompt in expanded_prompts], device=accelerator.device)
-        
-        # Gather indices across processes (like Flow-GRPO gathers prompt_ids)
-        gathered_prompt_indices = accelerator.gather(prompt_indices).cpu().numpy()
-        
-        # Convert back to prompts (like Flow-GRPO decodes prompt_ids to prompts)
-        gathered_prompts = [unique_prompts[idx] for idx in gathered_prompt_indices]
-        
-        if len(gathered_prompts) != len(gathered_rewards['avg']):
+        prompt_ids = accelerator.gather(samples["prompts_ids"]).cpu().numpy()
+        prompts_gather = pipeline.tokenizer.batch_decode(
+            prompt_ids, skip_special_tokens=True
+        )
+        if len(prompts_gather) != len(rewards_gather['avg']):
             raise RuntimeError(
                 f"Prompt-reward dimension mismatch: "
-                f"gathered_prompts={len(gathered_prompts)}, gathered_rewards={len(gathered_rewards['avg'])}. "
+                f"prompts_gather={len(prompts_gather)}, rewards_gather={len(rewards_gather['avg'])}. "
                 f"Expected: {len(samples['prompts'])} prompts * {config.sample.num_image_per_prompt} images_per_prompt * {accelerator.num_processes} processes = {len(samples['prompts']) * config.sample.num_image_per_prompt * accelerator.num_processes}"
             )
         
-        advantages = stat_tracker.update(gathered_prompts, gathered_rewards['avg'])
+        advantages = stat_tracker.update(prompts_gather, rewards_gather['avg'])
     else:
-        # Use global statistics (fallback)
-        advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
-    
-    # DEBUG: Check advantages computation
-    if accelerator.is_main_process:
-        print(f"gathered_rewards['avg'] value: {gathered_rewards['avg']}")
+        advantages = (rewards_gather['avg'] - rewards_gather['avg'].mean()) / (rewards_gather['avg'].std() + 1e-4)
     
     # Ungather advantages; we only need to keep the entries corresponding to the samples on this process
-    advantages = torch.as_tensor(advantages, device=accelerator.device).unsqueeze(-1)  # [12] -> [12, 1] for Flow-GRPO compatibility
-    
-    if accelerator.is_main_process:
-        print(f"accelerator.num_processes: {accelerator.num_processes}")
-        print(f"accelerator.process_index: {accelerator.process_index}")
-    
+    advantages = torch.as_tensor(advantages)
+   
     samples["advantages"] = (
         advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
         .to(accelerator.device)
     )
-    
-    if accelerator.is_main_process:
-        print(f"final advantages shape: {samples['advantages'].shape}")
-        print("=" * 40)
-    
-    # NOTE: Repeat advantages across all training timesteps
-    # The training loop expects advantages to have shape [batch_size, num_train_timesteps]
-    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction) if hasattr(config.train, 'timestep_fraction') else config.sample.num_steps
-    samples["advantages"] = samples["advantages"].repeat(1, num_train_timesteps)
-    
-    
-    # Store original rewards and repeat rewards along timestep dimension like Flow-GRPO
-    samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
-    samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, config.sample.num_steps)
     
     # Log stat tracker metrics if enabled (same place as original Flow-GRPO)
     if config.per_prompt_stat_tracking and stat_tracker is not None:
         group_size, trained_prompt_num = stat_tracker.get_stats()
         
         # Calculate zero std ratio using gathered rewards (same pattern as Flow-GRPO)
-        zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts, gathered_rewards)
+        zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts, rewards_gather)
         
         if accelerator.is_main_process:
             wandb.log({
@@ -493,7 +421,49 @@ def collect_samples_bagel(
         
         stat_tracker.clear()
     
-    return samples, gathered_rewards
+
+   
+    if global_step % 5 == 0 and accelerator.is_main_process:        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            num_samples = min(15, len(images))
+            sample_indices = random.sample(range(len(images)), num_samples)
+
+            for idx, i in enumerate(sample_indices):
+                image = images[i]
+                pil = Image.fromarray(
+                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                )
+                pil = pil.resize((config.resolution, config.resolution))
+                pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
+
+            sampled_prompts = [prompts_batch[i] for i in sample_indices]
+            sampled_rewards = [rewards['avg'][i] for i in sample_indices]
+
+            wandb.log(
+                {
+                    "images": [
+                        wandb.Image(
+                            os.path.join(tmpdir, f"{idx}.jpg"),
+                            caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
+                        )
+                        for idx, (prompt, avg_reward) in enumerate(zip(sampled_prompts, sampled_rewards))
+                    ],
+                },
+                step=global_step,
+            )
+
+
+    # Log rewards
+    if accelerator.is_main_process:
+        wandb.log(
+            {
+                "epoch": epoch,
+                **{f"reward_{key}": value.mean() for key, value in rewards_gather.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
+            },
+            step=global_step,
+        )
+
+    return samples
 
 def train_epoch_bagel(
     bagel_model,
@@ -511,53 +481,24 @@ def train_epoch_bagel(
 ):
     """Train one epoch for Bagel using Flow-GRPO's proper pattern."""
     
-    # Clean up processed data before shuffling (follow Flow-GRPO pattern)
-    del samples["rewards"]  # Rewards already processed into gathered_rewards
-    # Keep prompts for stat tracking, past_key_values for efficient training
+    del samples["rewards"]  
     
-    # Convert samples to batched format for training
-    total_batch_size = samples["latents"].shape[0]
-    
-    # Add assertion like Flux to catch timestep mismatches
-    _, num_timesteps = samples["timesteps"].shape
-    assert num_timesteps == config.sample.num_steps, f"Timestep mismatch: expected {config.sample.num_steps}, got {num_timesteps}"
+    total_batch_size = samples['latents'].shape[0]
+    print(f"total_batch_size: {total_batch_size}")
     
     # NOTE: Skip shuffling for Bagel - past_key_values cache is tied to specific prompts
     # Shuffling would break prompt-embedding correspondence, causing incorrect training
-    # TODO: Consider per-sample caches or cache reconstruction to enable shuffling
     
-    # Safety check: validate tensor dimensions before training
-    for k, v in samples.items():
-        if isinstance(v, torch.Tensor) and v.shape[0] != total_batch_size:
-            raise RuntimeError(
-                f"Tensor dimension mismatch: "
-                f"'{k}' has batch size {v.shape[0]}, expected {total_batch_size}. "
-                f"Shape: {v.shape}. This indicates a bug in sample collection."
-            )
-    
-    # Rebatch for training (no shuffling to preserve cache-data correspondence)
-    samples_batched = {}
-    for k, v in samples.items():
-        if k == "past_key_values":
-            # past_key_values is a NaiveCache object, don't reshape it
-            # Just use the same cache for all batches (Bagel handles this internally)
-            samples_batched[k] = [v] * config.sample.num_batches_per_epoch
-        elif isinstance(v, torch.Tensor):
-            # Reshape tensors without shuffling
-            samples_batched[k] = v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *v.shape[1:])
-        elif isinstance(v, list):
-            # Reshape lists without shuffling
-            batch_size = len(v) // config.sample.num_batches_per_epoch
-            samples_batched[k] = [v[i:i+batch_size] for i in range(0, len(v), batch_size)]
-        else:
-            # For other types, just repeat
-            samples_batched[k] = [v] * config.sample.num_batches_per_epoch
-    
+    # rebatch for training
+    samples_batched = {
+        k: v.reshape(-1, v.shape[0] // config.sample.num_batches_per_epoch, *v.shape[1:]) 
+        for k, v in samples.items()
+    }
     # dict of lists -> list of dicts for easier iteration
     samples_batched = [
         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
     ]
-    
+
     # Set model to training mode (like SD3 script)
     bagel_model.train()
     
@@ -568,7 +509,7 @@ def train_epoch_bagel(
         disable=not accelerator.is_local_main_process,
     ):
         # Use step indices for training - follow Flux pattern
-        train_timesteps = [step_index for step_index in range(num_train_timesteps)]
+        train_timesteps = [step_index for step_index in range(num_train_timesteps-1)]
         
         for j in tqdm(
             train_timesteps,
@@ -577,34 +518,33 @@ def train_epoch_bagel(
             leave=False,
             disable=not accelerator.is_local_main_process,
         ):
+
             with accelerator.accumulate(bagel_model):
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16 if config.mixed_precision == "bf16" else torch.float32):
-                    # Compute log probability using Bagel's native approach
+                    # Compute log probability using Bagel's native approach (packed format)
                     unwrapped_model = bagel_model.module if hasattr(bagel_model, 'module') else bagel_model
-                    prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob_bagel_native(
+                    log_prob, prev_sample_mean_packed, std_dev_t = compute_log_prob_bagel_native(
                         bagel_model=unwrapped_model,
                         sample=sample,
                         timestep_idx=j,
                         config=config,
                         tokenizer=pipeline.tokenizer,
                         new_token_ids=pipeline.new_token_ids,
-                        scheduler=pipeline.scheduler,  # Pass the pipeline's scheduler for consistency
                         policy_train=True,
                     )
                     
                     if config.train.beta > 0:
                         with torch.no_grad():
-                            # Reference computation for KL loss
+                            # Reference computation for KL loss (packed format)
                             # Disable adapter on the entire model
                             with unwrapped_model.disable_adapter():
-                                _, _, prev_sample_mean_ref, _ = compute_log_prob_bagel_native(
+                                _, prev_sample_mean_ref_packed, _ = compute_log_prob_bagel_native(
                                     bagel_model=unwrapped_model,
                                     sample=sample,
                                     timestep_idx=j,
                                     config=config,
                                     tokenizer=pipeline.tokenizer,
                                     new_token_ids=pipeline.new_token_ids,
-                                    scheduler=pipeline.scheduler,  # Pass the pipeline's scheduler for consistency
                                     policy_train=True,
                                 )
 
@@ -623,9 +563,13 @@ def train_epoch_bagel(
                 )
                 policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
                 
-                # Add KL loss if enabled
+                # Add KL loss if enabled (computed directly in packed format)
                 if config.train.beta > 0:
-                    kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
+                    # Compute KL loss directly in packed format using PyTorch operations
+                    squared_diff = (prev_sample_mean_packed - prev_sample_mean_ref_packed) ** 2
+                    batch_size = sample["timesteps"].shape[0]
+                    patches_per_sample = prev_sample_mean_packed.shape[0] // batch_size
+                    kl_loss = squared_diff.view(batch_size, patches_per_sample, -1).mean(dim=(1, 2)) / (2 * std_dev_t ** 2)
                     kl_loss = torch.mean(kl_loss)
                     loss = policy_loss + config.train.beta * kl_loss
                 else:
@@ -916,7 +860,7 @@ def main(_):
     
     set_seed(config.seed, device_specific=True)
 
-    bagel_model, vae, tokenizer, new_token_ids = load_bagel_model(config)
+    bagel_model, vae, tokenizer, new_token_ids = load_bagel_model(config, accelerator)
 
     inference_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -1019,20 +963,11 @@ def main(_):
         #################### SAMPLING ####################
         # Reset iterator for each epoch to avoid StopIteration
         train_iter = iter(train_dataloader)
-        samples, gathered_rewards = collect_samples_bagel(
+        samples = collect_samples_bagel(
             pipeline, train_iter, config, accelerator,
             reward_fn, stat_tracker, epoch, global_step
         )
-        
-        # Log rewards
-        if accelerator.is_main_process:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
-                },
-                step=global_step,
-            )
+    
         
         #################### TRAINING ####################
         # Calculate num_train_timesteps for this epoch
